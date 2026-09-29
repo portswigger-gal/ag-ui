@@ -9,7 +9,7 @@ import {
   makeRemoteMastraAgent,
   makeInput,
   collectEvents,
-  collectError,
+  collectRunError,
 } from "./helpers";
 import { MastraAgent } from "../mastra";
 
@@ -729,7 +729,7 @@ describe("interrupt bridge: tool-call buffering", () => {
     expect(JSON.parse((customEvents[0] as any).value).toolCallId).toBe("tc-b");
   });
 
-  it("remote error chunk stops processing — no post-error events emitted", async () => {
+  it("remote error chunk stops processing: one RUN_ERROR, no post-error events", async () => {
     const chunks = [
       { type: "text-delta", payload: { text: "before" } },
       { type: "error", payload: { error: "something went wrong" } },
@@ -737,16 +737,20 @@ describe("interrupt bridge: tool-call buffering", () => {
     ];
 
     const agent = makeRemoteMastraAgent({ streamChunks: chunks });
-    const { error, events } = await collectError(agent, makeInput());
+    const { error, events } = await collectRunError(agent, makeInput());
 
     expect(error.message).toBe("something went wrong");
 
-    // Only RUN_STARTED + the pre-error text chunk — no post-error text
+    // Only RUN_STARTED + the pre-error text chunk + RUN_ERROR, no post-error text
     const textChunks = events.filter(
       (e) => e.type === EventType.TEXT_MESSAGE_CHUNK,
     );
     expect(textChunks).toHaveLength(1);
     expect((textChunks[0] as any).delta).toBe("before");
+    const runErrors = events.filter((e) => e.type === EventType.RUN_ERROR);
+    expect(runErrors).toHaveLength(1);
+    expect((runErrors[0] as any).message).toBe("something went wrong");
+    expect(events[events.length - 1].type).toBe(EventType.RUN_ERROR);
   });
 
   it("local error chunk does not trigger post-error onRunFinished work", async () => {
@@ -764,9 +768,14 @@ describe("interrupt bridge: tool-call buffering", () => {
     ];
 
     const agent = makeLocalMastraAgent({ memory, streamChunks: chunks });
-    const { error } = await collectError(agent, makeInput());
+    const { error, events } = await collectRunError(agent, makeInput());
 
     expect(error.message).toBe("local agent failed");
+    expect(events.map((e) => e.type)).toEqual([
+      EventType.RUN_STARTED,
+      EventType.TEXT_MESSAGE_CHUNK,
+      EventType.RUN_ERROR,
+    ]);
 
     // Allow any pending async work (onRunFinished) to settle
     await new Promise((r) => setTimeout(r, 50));
@@ -785,14 +794,15 @@ describe("interrupt bridge: tool-call buffering", () => {
     ];
 
     const agent = makeRemoteMastraAgent({ streamChunks: chunks });
-    const { error, events } = await collectError(agent, makeInput());
+    const { error, events } = await collectRunError(agent, makeInput());
 
     expect(error.message).toBe("remote agent failed");
-    // Only RUN_STARTED + one text chunk before error — no post-error events
+    // RUN_STARTED + one text chunk, then the RUN_ERROR; no post-error events
     const types = events.map((e) => e.type);
     expect(types).toEqual([
       EventType.RUN_STARTED,
       EventType.TEXT_MESSAGE_CHUNK,
+      EventType.RUN_ERROR,
     ]);
   });
 
@@ -933,7 +943,7 @@ describe("interrupt bridge: tool-call buffering", () => {
       ],
     });
 
-    const { error, events } = await collectError(agent, makeInput());
+    const { error, events } = await collectRunError(agent, makeInput());
 
     expect(error.message).toContain("Malformed tool-call-suspended");
     expect(events[0]?.type).toBe(EventType.RUN_STARTED);
@@ -1380,7 +1390,7 @@ describe("interrupt bridge: resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error } = await collectError(
+    const { error } = await collectRunError(
       agent,
       makeResumeInput({
         type: "mastra_suspend",
@@ -1395,7 +1405,7 @@ describe("interrupt bridge: resume path", () => {
   it("errors on malformed interruptEvent JSON", async () => {
     const { agent } = makeFakeLocalAgentWithResumeStream([]);
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeInput({
         forwardedProps: {
@@ -1409,31 +1419,40 @@ describe("interrupt bridge: resume path", () => {
 
     expect(error.message).toContain("Invalid interruptEvent");
     // Protocol invariant: RUN_STARTED must be emitted before any error
-    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+    expect(events.map((e) => e.type)).toEqual([
+      EventType.RUN_STARTED,
+      EventType.RUN_ERROR,
+    ]);
   });
 
   it("errors when interruptEvent is missing toolCallId", async () => {
     const { agent } = makeFakeLocalAgentWithResumeStream([]);
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeResumeInput({ type: "mastra_suspend", runId: "run-1" }), // no toolCallId
     );
 
     expect(error.message).toContain("missing toolCallId or runId");
-    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+    expect(events.map((e) => e.type)).toEqual([
+      EventType.RUN_STARTED,
+      EventType.RUN_ERROR,
+    ]);
   });
 
   it("errors when interruptEvent is missing runId", async () => {
     const { agent } = makeFakeLocalAgentWithResumeStream([]);
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeResumeInput({ type: "mastra_suspend", toolCallId: "tc-1" }), // no runId
     );
 
     expect(error.message).toContain("missing toolCallId or runId");
-    expect(events[0]?.type).toBe(EventType.RUN_STARTED);
+    expect(events.map((e) => e.type)).toEqual([
+      EventType.RUN_STARTED,
+      EventType.RUN_ERROR,
+    ]);
   });
 
   it("errors when resumeStream returns null", async () => {
@@ -1446,7 +1465,7 @@ describe("interrupt bridge: resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeResumeInput({
         type: "mastra_suspend",
@@ -1566,7 +1585,7 @@ describe("interrupt bridge: resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error } = await collectError(
+    const { error } = await collectRunError(
       agent,
       makeResumeInput({
         type: "mastra_suspend",
@@ -1578,14 +1597,14 @@ describe("interrupt bridge: resume path", () => {
     expect(error.message).toContain("fullStream");
   });
 
-  it("propagates error chunk in resumed stream without RUN_FINISHED", async () => {
+  it("propagates error chunk in resumed stream as one RUN_ERROR without RUN_FINISHED", async () => {
     const { agent } = makeFakeLocalAgentWithResumeStream([
       { type: "text-delta", payload: { text: "Approving..." } },
       { type: "error", payload: { error: "LLM rate limited" } },
       { type: "text-delta", payload: { text: "should not appear" } },
     ]);
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeResumeInput({
         type: "mastra_suspend",
@@ -1609,6 +1628,12 @@ describe("interrupt bridge: resume path", () => {
     );
     expect(textChunks).toHaveLength(1);
     expect((textChunks[0] as any).delta).toBe("Approving...");
+    expect(events.map((e) => e.type)).toEqual([
+      EventType.RUN_STARTED,
+      EventType.TEXT_MESSAGE_CHUNK,
+      EventType.RUN_ERROR,
+    ]);
+    expect((events[2] as any).message).toBe("LLM rate limited");
   });
 
   it("propagates memory management errors to subscriber", async () => {
@@ -1623,7 +1648,7 @@ describe("interrupt bridge: resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeInput({ state: { someKey: "someValue" } }),
     );
@@ -1645,7 +1670,7 @@ describe("interrupt bridge: resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error, events } = await collectError(agent, makeInput());
+    const { error, events } = await collectRunError(agent, makeInput());
 
     // The error must reach the subscriber — not be silently swallowed
     expect(error.message).toBe("Connection refused");
@@ -1665,7 +1690,7 @@ describe("interrupt bridge: resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error, events } = await collectError(agent, makeInput());
+    const { error, events } = await collectRunError(agent, makeInput());
 
     expect(error.message).toBe("Remote auth failed");
     expect(events[0]?.type).toBe(EventType.RUN_STARTED);
@@ -1688,7 +1713,7 @@ describe("interrupt bridge: resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeResumeInput({
         type: "mastra_suspend",
@@ -1713,7 +1738,7 @@ describe("interrupt bridge: resume path", () => {
       },
     });
 
-    const { error } = await collectError(agent, input);
+    const { error } = await collectRunError(agent, input);
     expect(error.message).toBe("Unexpected getter failure");
   });
 });
@@ -1822,14 +1847,14 @@ describe("interrupt bridge: remote resume path", () => {
     expect(value.suspendPayload).toEqual({ step: 2 });
   });
 
-  it("propagates an error chunk in the resumed remote stream without RUN_FINISHED", async () => {
+  it("propagates an error chunk in the resumed remote stream as one RUN_ERROR without RUN_FINISHED", async () => {
     const { agent } = makeFakeRemoteAgentWithResumeStream([
       { type: "text-delta", payload: { text: "Approving..." } },
       { type: "error", payload: { error: "LLM rate limited" } },
       { type: "text-delta", payload: { text: "should not appear" } },
     ]);
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeResumeInput({
         type: "mastra_suspend",
@@ -1848,6 +1873,12 @@ describe("interrupt bridge: remote resume path", () => {
     );
     expect(textChunks).toHaveLength(1);
     expect((textChunks[0] as any).delta).toBe("Approving...");
+    expect(events.map((e) => e.type)).toEqual([
+      EventType.RUN_STARTED,
+      EventType.TEXT_MESSAGE_CHUNK,
+      EventType.RUN_ERROR,
+    ]);
+    expect((events[2] as any).message).toBe("LLM rate limited");
   });
 
   it("propagates an error when remote resumeStream throws", async () => {
@@ -1862,7 +1893,7 @@ describe("interrupt bridge: remote resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error } = await collectError(
+    const { error } = await collectRunError(
       agent,
       makeResumeInput({
         type: "mastra_suspend",
@@ -1884,7 +1915,7 @@ describe("interrupt bridge: remote resume path", () => {
       resourceId: "resource-1",
     });
 
-    const { error, events } = await collectError(
+    const { error, events } = await collectRunError(
       agent,
       makeResumeInput({
         type: "mastra_suspend",
